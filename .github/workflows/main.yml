@@ -1,0 +1,82 @@
+name: Deploy React App to GitHub Pages
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-deploy:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            **/node_modules
+            ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+            
+      - name: Install dependencies
+        run: npm ci
+        
+      - name: Check for linting errors
+        run: npm run lint --if-present
+        
+      - name: Run tests
+        run: npm test --if-present
+        
+      - name: Build project
+        run: npm run build
+        env:
+          CI: false # Prevents treating warnings as errors
+          
+      - name: Deploy to GitHub Pages
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          folder: build # The folder the action should deploy
+          branch: gh-pages # The branch the action should deploy to
+          clean: true # Automatically remove deleted files from the deployment
+          commit-message: "Deploy React application to GitHub Pages"
+          
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-files
+          path: build/
+          
+  notify:
+    needs: build-and-deploy
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Check build status
+        if: ${{ needs.build-and-deploy.result == 'success' }}
+        run: |
+          echo "🎉 Deploy successful!"
+          echo "Your site should be live at https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+      
+      - name: Notify on failure
+        if: ${{ needs.build-and-deploy.result == 'failure' }}
+        run: |
+          echo "❌ Deploy failed!"
+          echo "Please check the build logs for more information." 
