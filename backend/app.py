@@ -1,8 +1,9 @@
 import os
 import requests
-import paramiko
 import logging
 import re
+import shutil
+import subprocess
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -12,28 +13,17 @@ from urllib.parse import urlparse
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-# Set up Paramiko logging
-paramiko.util.log_to_file("paramiko.log")
-
 # Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
 
-# Get VM configuration from environment variables
-VM_IP = os.getenv("VM_IP")
-VM_USER = os.getenv("VM_USER", "root")
-VM_PASSWORD = os.getenv("VM_PASSWORD")
-VM_KEY_PATH = os.getenv("VM_KEY_PATH")
-VM_DESTINATION = os.getenv("VM_DESTINATION", "/home/ubuntu")
+# Local destination directory
+LOCAL_DESTINATION = os.getenv("LOCAL_DESTINATION", "/var/www/html")
 
 # Print configuration for debugging
-logger.info(f"VM_IP: {VM_IP}")
-logger.info(f"VM_USER: {VM_USER}")
-logger.info(f"VM_PASSWORD: {'*****' if VM_PASSWORD else 'Not set'}")
-logger.info(f"VM_KEY_PATH: {VM_KEY_PATH}")
-logger.info(f"VM_DESTINATION: {VM_DESTINATION}")
+logger.info(f"LOCAL_DESTINATION: {LOCAL_DESTINATION}")
 
 
 @app.route("/api/process-github", methods=["POST"])
@@ -116,13 +106,13 @@ def process_github():
         filename = os.path.basename(urlparse(raw_url).path)
         logger.info(f"Extracted filename: {filename}")
 
-        # Copy file to VM
-        success, message = copy_to_vm(file_content, filename)
+        # Save file locally
+        success, message = save_file_locally(file_content, filename)
 
         if success:
             return (
                 jsonify(
-                    {"message": f"Successfully copied {filename} to VM at {VM_IP}"}
+                    {"message": f"Successfully saved {filename} to local destination"}
                 ),
                 200,
             )
@@ -165,8 +155,8 @@ def clone_and_deploy():
         )
 
     try:
-        # Clone repository and set up GitHub Pages
-        success, message = setup_github_pages(github_url, project_name)
+        # Clone repository locally
+        success, message = clone_repo_locally(github_url, project_name)
 
         if success:
             # Extract username and repo name from GitHub URL
@@ -175,13 +165,13 @@ def clone_and_deploy():
             username = path_parts[0]
             repo_name = path_parts[1]
 
-            # Generate GitHub Pages URL
+            # Generate GitHub Pages URL (just for compatibility with old code)
             pages_url = f"https://{username}.github.io/{repo_name}"
 
             return (
                 jsonify(
                     {
-                        "message": "Repository cloned and GitHub Pages configured successfully",
+                        "message": "Repository cloned successfully",
                         "deployment_url": pages_url,
                         "details": message,
                     }
@@ -241,179 +231,30 @@ def convert_to_raw_url(github_url):
     return None
 
 
-def copy_to_vm(file_content, filename):
-    """Copy file content to VM using SSH."""
-    if not VM_IP:
-        logger.error("VM_IP environment variable not set")
-        return False, "VM_IP environment variable not set"
-
+def save_file_locally(file_content, filename):
+    """Save file content to the local destination directory."""
     try:
-        logger.info(f"Attempting to connect to VM at {VM_IP} with user {VM_USER}")
-
-        # Set up SSH client
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-        connected = False
-
-        # Try to connect using key file if provided
-        if VM_KEY_PATH:
-            logger.info(f"Attempting to connect using key file at path: {VM_KEY_PATH}")
-            try:
-                # Check if key file exists
-                if not os.path.exists(VM_KEY_PATH):
-                    logger.error(f"Key file does not exist: {VM_KEY_PATH}")
-                    return False, f"Key file does not exist: {VM_KEY_PATH}"
-
-                # Try RSA key first
-                try:
-                    logger.info("Trying to load as RSA key")
-                    private_key = paramiko.RSAKey.from_private_key_file(VM_KEY_PATH)
-                    ssh.connect(VM_IP, username=VM_USER, pkey=private_key, timeout=10)
-                    connected = True
-                    logger.info("Connected using RSA key")
-                except Exception as rsa_error:
-                    logger.warning(f"Failed to connect with RSA key: {str(rsa_error)}")
-
-                    # Try Ed25519 key if RSA fails
-                    try:
-                        logger.info("Trying to load as Ed25519 key")
-                        private_key = paramiko.Ed25519Key.from_private_key_file(
-                            VM_KEY_PATH
-                        )
-                        ssh.connect(
-                            VM_IP, username=VM_USER, pkey=private_key, timeout=10
-                        )
-                        connected = True
-                        logger.info("Connected using Ed25519 key")
-                    except Exception as ed_error:
-                        logger.warning(
-                            f"Failed to connect with Ed25519 key: {str(ed_error)}"
-                        )
-                        # Let the next authentication method try
-            except Exception as e:
-                logger.error(f"Error with key file: {str(e)}")
-                return False, f"Error with key file: {str(e)}"
-
-        # Try password if key didn't work
-        if not connected and VM_PASSWORD:
-            logger.info("Attempting to connect using password")
-            try:
-                ssh.connect(VM_IP, username=VM_USER, password=VM_PASSWORD, timeout=10)
-                connected = True
-                logger.info("Connected using password")
-            except Exception as e:
-                logger.error(f"Failed to connect with password: {str(e)}")
-                # Continue to error handling
-
-        # If we didn't connect with either method
-        if not connected:
-            logger.error("Failed to connect via any method")
-            return (
-                False,
-                "Failed to authenticate with VM. Check VM_KEY_PATH or VM_PASSWORD",
-            )
-
-        logger.info("Successfully connected to VM, creating SFTP client")
-
-        # Create SFTP client
-        sftp = ssh.open_sftp()
-
-        # Create temporary file locally using platform-appropriate temp directory
-        import tempfile
-
-        temp_dir = tempfile.gettempdir()
-        temp_path = os.path.join(temp_dir, filename)
-
+        # Ensure the destination directory exists
+        os.makedirs(LOCAL_DESTINATION, exist_ok=True)
+        
+        # Construct the full destination path
+        destination = os.path.join(LOCAL_DESTINATION, filename)
+        logger.info(f"Saving file to: {destination}")
+        
         # Determine write mode based on content type
         is_binary = isinstance(file_content, bytes)
         write_mode = "wb" if is_binary else "w"
-
-        logger.info(f"Writing temporary file to {temp_path}")
-        with open(temp_path, write_mode) as f:
+        
+        # Write the file
+        with open(destination, write_mode) as f:
             f.write(file_content)
-
-        # Ensure destination directory exists
-        destination = f"{VM_DESTINATION}/{filename}"
-        logger.info(f"Copying file to VM path: {destination}")
-
-        try:
-            # Check directory permissions
-            try:
-                stdin, stdout, stderr = ssh.exec_command(f"ls -la {VM_DESTINATION}")
-                output = stdout.read().decode("utf-8")
-                error = stderr.read().decode("utf-8")
-                logger.info(f"Destination directory listing: {output}")
-                if error:
-                    logger.warning(f"Error listing destination directory: {error}")
-
-                # Check if we can write to the directory
-                test_file = f"{VM_DESTINATION}/.write_test"
-                stdin, stdout, stderr = ssh.exec_command(
-                    f"touch {test_file} && rm {test_file}"
-                )
-                exit_status = stdout.channel.recv_exit_status()
-                if exit_status != 0:
-                    error = stderr.read().decode("utf-8")
-                    logger.warning(f"Permission test failed: {error}")
-                else:
-                    logger.info("Write permission test succeeded")
-            except Exception as e:
-                logger.warning(f"Failed to check directory permissions: {str(e)}")
-
-            # Try to create destination directory
-            try:
-                stdin, stdout, stderr = ssh.exec_command(f"mkdir -p {VM_DESTINATION}")
-                exit_status = stdout.channel.recv_exit_status()
-                if exit_status != 0:
-                    error = stderr.read().decode("utf-8")
-                    logger.warning(f"Warning creating destination directory: {error}")
-            except Exception as e:
-                logger.warning(f"Failed to create destination directory: {str(e)}")
-
-            # Copy file to VM with detailed error handling
-            try:
-                logger.info(
-                    f"Starting SFTP put operation: {temp_path} -> {destination}"
-                )
-                sftp.put(temp_path, destination)
-                logger.info("File successfully copied to VM")
-            except IOError as e:
-                logger.error(f"SFTP IOError: {str(e)}")
-                # Try to get additional context about the destination
-                try:
-                    stdin, stdout, stderr = ssh.exec_command(f"stat {VM_DESTINATION}")
-                    output = stdout.read().decode("utf-8")
-                    logger.info(f"Destination stat: {output}")
-                except Exception as stat_err:
-                    logger.error(f"Failed to get directory stats: {str(stat_err)}")
-                return (
-                    False,
-                    f"SFTP IOError: {str(e)}. Please check if the destination directory exists and has correct permissions.",
-                )
-            except Exception as e:
-                logger.error(f"SFTP error: {str(e)}")
-                return False, f"SFTP error: {str(e)}"
-
-        except Exception as e:
-            logger.error(f"SFTP operation failed: {str(e)}")
-            return False, f"SFTP operation failed: {str(e)}"
-        finally:
-            # Clean up
-            try:
-                os.remove(temp_path)
-                logger.info("Temporary file removed")
-            except Exception as e:
-                logger.warning(f"Could not remove temporary file: {str(e)}")
-
-            sftp.close()
-            ssh.close()
-            logger.info("SSH connection closed")
-
-        return True, "File copied successfully"
+            
+        logger.info(f"File successfully saved to {destination}")
+        return True, f"File saved successfully to {destination}"
+    
     except Exception as e:
-        logger.error(f"Error copying file to VM: {str(e)}")
-        return False, f"Error copying file to VM: {str(e)}"
+        logger.error(f"Error saving file locally: {str(e)}")
+        return False, f"Error saving file locally: {str(e)}"
 
 
 def is_valid_github_repo_url(url):
@@ -422,101 +263,63 @@ def is_valid_github_repo_url(url):
     return bool(re.match(pattern, url))
 
 
-def setup_github_pages(github_url, project_name):
-    """Clone repository and set up GitHub Pages deployment."""
+def clone_repo_locally(github_url, project_name):
+    """Clone repository locally."""
     try:
-        if not VM_IP:
-            return False, "VM_IP environment variable not set"
-
-        # Set up SSH client
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-        # Connect to VM (reusing existing connection logic)
-        connected = False
-        if VM_KEY_PATH:
-            try:
-                private_key = paramiko.RSAKey.from_private_key_file(VM_KEY_PATH)
-                ssh.connect(VM_IP, username=VM_USER, pkey=private_key)
-                connected = True
-            except:
-                try:
-                    private_key = paramiko.Ed25519Key.from_private_key_file(VM_KEY_PATH)
-                    ssh.connect(VM_IP, username=VM_USER, pkey=private_key)
-                    connected = True
-                except:
-                    pass
-
-        if not connected and VM_PASSWORD:
-            ssh.connect(VM_IP, username=VM_USER, password=VM_PASSWORD)
-            connected = True
-
-        if not connected:
-            return False, "Failed to authenticate with VM"
-
         # Create project directory
-        project_dir = f"{VM_DESTINATION}/{project_name}"
-        commands = [
-            f"mkdir -p {project_dir}",
-            f"cd {project_dir}",
-            f"git clone {github_url} .",
-            "npm install",  # Install dependencies
-            # Create GitHub Actions workflow for Pages deployment
-            "mkdir -p .github/workflows",
-            """cat > .github/workflows/deploy.yml << 'EOL'
-name: Deploy to GitHub Pages
-
-on:
-  push:
-    branches: [ main ]
-  workflow_dispatch:
-
-jobs:
-  build-and-deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v2
-      
-      - name: Setup Node.js
-        uses: actions/setup-node@v2
-        with:
-          node-version: '16'
-          
-      - name: Install Dependencies
-        run: npm install
+        project_dir = os.path.join(LOCAL_DESTINATION, project_name)
+        logger.info(f"Cloning repository to: {project_dir}")
         
-      - name: Build
-        run: npm run build
+        # Create directory if it doesn't exist
+        os.makedirs(project_dir, exist_ok=True)
         
-      - name: Deploy to GitHub Pages
-        uses: JamesIves/github-pages-deploy-action@4.1.5
-        with:
-          branch: gh-pages
-          folder: build
-EOL""",
-            # Update package.json with homepage field
-            f"""sed -i '/"name"/a \  "homepage": "{github_url}",' package.json""",
-            # Commit and push changes
-            "git add .",
-            'git config --global user.email "deploy@example.com"',
-            'git config --global user.name "Deployment Bot"',
-            'git commit -m "Configure GitHub Pages deployment"',
-            "git push",
-        ]
-
-        # Execute commands
-        for cmd in commands:
-            stdin, stdout, stderr = ssh.exec_command(cmd)
-            exit_status = stdout.channel.recv_exit_status()
-            if exit_status != 0:
-                error = stderr.read().decode("utf-8")
-                return False, f"Command failed: {cmd}\nError: {error}"
-
-        ssh.close()
-        return True, "Repository cloned and GitHub Pages configured successfully"
-
+        # Check if directory is empty
+        if os.listdir(project_dir):
+            logger.warning(f"Directory {project_dir} is not empty, clearing it")
+            # Clear directory content
+            for item in os.listdir(project_dir):
+                item_path = os.path.join(project_dir, item)
+                if os.path.isdir(item_path):
+                    shutil.rmtree(item_path)
+                else:
+                    os.remove(item_path)
+        
+        # Clone the repository
+        result = subprocess.run(
+            ["git", "clone", github_url, "."],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            check=False
+        )
+        
+        if result.returncode != 0:
+            logger.error(f"Git clone failed: {result.stderr}")
+            return False, f"Git clone failed: {result.stderr}"
+        
+        logger.info(f"Repository cloned successfully to {project_dir}")
+        
+        # Try to run npm install if package.json exists
+        if os.path.exists(os.path.join(project_dir, "package.json")):
+            logger.info("package.json found, running npm install")
+            npm_result = subprocess.run(
+                ["npm", "install"],
+                cwd=project_dir,
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            
+            if npm_result.returncode != 0:
+                logger.warning(f"npm install warning: {npm_result.stderr}")
+            else:
+                logger.info("npm install completed successfully")
+        
+        return True, f"Repository cloned successfully to {project_dir}"
+    
     except Exception as e:
-        return False, f"Error setting up GitHub Pages: {str(e)}"
+        logger.error(f"Error cloning repository: {str(e)}")
+        return False, f"Error cloning repository: {str(e)}"
 
 
 # Add application-level error handler
@@ -531,12 +334,7 @@ def internal_error(error):
 
 if __name__ == "__main__":
     logger.info("========================= STARTING SERVER =========================")
-    logger.info(
-        f"Configuration: VM_IP={VM_IP}, VM_USER={VM_USER}, VM_KEY_PATH={VM_KEY_PATH}"
-    )
-    logger.info("Make sure to set the environment variables in the .env file")
-    logger.info(
-        "If using key authentication, ensure key file exists and has correct permissions"
-    )
+    logger.info(f"Configuration: LOCAL_DESTINATION={LOCAL_DESTINATION}")
+    logger.info("Make sure LOCAL_DESTINATION directory exists and has write permissions")
     logger.info("==================================================================")
     app.run(debug=True, host="0.0.0.0", port=5000)
