@@ -80,16 +80,16 @@ function App() {
                 <div className="w-6 h-6 border-2 border-white transform -rotate-45"></div>
               </div>
             </div>
-            <div className="text-2xl font-light tracking-wide">Build it yourself</div>
+            <div className="text-2xl font-light tracking-wide">Study it yourself</div>
           </div>
 
           {/* Main Text */}
           <div className="text-center my-16">
             <div className="text-[100px] font-bold leading-none bg-gradient-to-r from-[#00FF00] via-[#7FFF00] to-[#98FB98] text-transparent bg-clip-text bg-size-200 animate-gradient tracking-tight">
-              vercel.diy
+              diystudy
             </div>
             <div className="text-xl tracking-wider mt-2 font-light text-gray-400">
-              DEPLOY YOUR CREATIVITY • BUILD YOUR VISION
+              UNLEASH YOUR CREATIVITY • BUILD YOUR OWN TUTOR
             </div>
           </div>
 
